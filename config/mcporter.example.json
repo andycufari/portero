@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "portero": {
+      "url": "http://127.0.0.1:8443/mcp/message",
+      "headers": {
+        "Authorization": "Bearer your-bearer-token-here"
+      }
+    }
+  }
+}

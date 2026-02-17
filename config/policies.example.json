@@ -1,0 +1,31 @@
+{
+  "policies": {
+    "github/create_issue": "allow",
+    "github/create_pull_request": "require-approval",
+
+    "filesystem/read_file": "allow",
+    "filesystem/write_file": "require-approval",
+    "filesystem/edit_file": "require-approval",
+    "filesystem/delete_file": "deny",
+    "filesystem/list_directory": "allow",
+    "filesystem/search_files": "allow",
+
+    "google/search_gmail_messages": "allow",
+    "google/get_gmail_message_content": "allow",
+    "google/send_gmail_message": "require-approval",
+    "google/draft_gmail_message": "require-approval",
+
+    "google/get_events": "allow",
+    "google/create_event": "require-approval",
+    "google/delete_event": "require-approval",
+
+    "google/search_drive_files": "allow",
+    "google/create_drive_file": "require-approval",
+
+    "notion/API-post-search": "allow",
+    "notion/API-retrieve-a-page": "allow",
+    "notion/API-post-page": "require-approval",
+    "notion/API-delete-a-block": "require-approval"
+  },
+  "defaultPolicy": "require-approval"
+}

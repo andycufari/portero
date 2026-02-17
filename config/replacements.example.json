@@ -1,0 +1,26 @@
+{
+  "replacements": [
+    {
+      "fake": "John Doe",
+      "real": "${REAL_NAME}",
+      "bidirectional": true
+    },
+    {
+      "fake": "john@example.com",
+      "real": "${REAL_EMAIL}",
+      "bidirectional": true,
+      "caseSensitive": false
+    },
+    {
+      "fake": "1234567890000000000000",
+      "real": "${REAL_BANK_ACCOUNT}",
+      "bidirectional": true
+    },
+    {
+      "fake": "fake-api-key-12345",
+      "real": "${REAL_API_KEY}",
+      "bidirectional": false,
+      "responseReplacement": "***API-KEY***"
+    }
+  ]
+}

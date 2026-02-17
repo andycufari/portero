@@ -1,0 +1,13 @@
+node_modules/
+dist/
+data/
+certs/
+config/secrets.json
+config/replacements.json
+config/mcps.json
+config/policies.json
+config/mcporter.json
+.env
+.DS_Store
+*.log
+*.db

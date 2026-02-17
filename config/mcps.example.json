@@ -1,0 +1,43 @@
+{
+  "mcps": [
+    {
+      "name": "filesystem",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
+      "env": {}
+    },
+    {
+      "name": "github",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+      }
+    },
+    {
+      "name": "google",
+      "command": "uvx",
+      "args": ["workspace-mcp", "--tools", "gmail", "calendar", "drive"],
+      "env": {
+        "GOOGLE_OAUTH_CLIENT_ID": "${GOOGLE_OAUTH_CLIENT_ID}",
+        "GOOGLE_OAUTH_CLIENT_SECRET": "${GOOGLE_OAUTH_CLIENT_SECRET}"
+      },
+      "pinnedTools": [
+        "search_gmail_messages",
+        "send_gmail_message",
+        "get_gmail_message_content",
+        "get_events",
+        "create_event",
+        "search_drive_files"
+      ]
+    },
+    {
+      "name": "notion",
+      "command": "npx",
+      "args": ["-y", "@notionhq/notion-mcp-server"],
+      "env": {
+        "OPENAPI_MCP_HEADERS": "{\"Authorization\":\"Bearer ${NOTION_API_TOKEN}\",\"Notion-Version\":\"2022-06-28\"}"
+      }
+    }
+  ]
+}

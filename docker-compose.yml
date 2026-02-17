@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  gateway:
+    build: .
+    container_name: portero
+    ports:
+      - "3055:3055"
+    volumes:
+      # Mount config files (customize these)
+      - ./config:/app/config:ro
+      # Mount data directory for SQLite database
+      - ./data:/app/data
+      # Mount logs directory
+      - ./logs:/app/logs
+      # Optional: Mount SSL certificates
+      - ./certs:/app/certs:ro
+    env_file:
+      - .env
+    restart: unless-stopped
+    networks:
+      - mcp-network
+
+networks:
+  mcp-network:
+    driver: bridge
