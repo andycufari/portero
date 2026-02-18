@@ -80,6 +80,7 @@ const CATEGORY_KEYWORDS: Record<string, string[]> = {
   gmail: ['gmail', 'message', 'label', 'filter', 'thread'],
   calendar: ['calendar', 'event', 'freebusy'],
   drive: ['drive', 'file', 'folder', 'permission'],
+  email: ['mail', 'message', 'send_email', 'gmail', 'send_gmail'],
 };
 
 export class MCPHandler {
