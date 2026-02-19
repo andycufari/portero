@@ -4,7 +4,7 @@ A self-hosted MCP (Model Context Protocol) gateway that sits between Claude Code
 
 - **MCP Aggregation** — Connect multiple MCPs and expose them as one unified endpoint
 - **Data Anonymization** — Bidirectional fake↔real data replacement for privacy
-- **2FA Approvals** — Telegram bot for approving sensitive operations
+- **Async 2FA Approvals** — Non-blocking Telegram approval flow with task tracking
 - **Permission Policies** — Allow/deny/require-approval per tool
 - **Remote Access** — HTTPS endpoint accessible from anywhere
 
@@ -13,7 +13,8 @@ A self-hosted MCP (Model Context Protocol) gateway that sits between Claude Code
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    TELEGRAM BOT                             │
-│  /status, /grant, /revoke, approval callbacks               │
+│  /status, /grant, /revoke, /tasks, approval callbacks       │
+│  Executes approved tasks asynchronously                     │
 └─────────────────────┬───────────────────────────────────────┘
                       │
 ┌─────────────────────▼───────────────────────────────────────┐
@@ -27,18 +28,22 @@ A self-hosted MCP (Model Context Protocol) gateway that sits between Claude Code
 │  │ Middleware Pipeline                                    ││
 │  │ 1. Anonymization (fake→real on requests)              ││
 │  │ 2. Policy Check (allow/deny/require-approval)         ││
-│  │ 3. 2FA Gate (wait for Telegram approval if needed)    ││
-│  │ 4. Route to child MCP                                  ││
+│  │ 3. If approval needed → create task, return pending   ││
+│  │ 4. If allowed → route to child MCP immediately        ││
 │  │ 5. Anonymization (real→fake on responses)             ││
+│  └────────────────────────────────────────────────────────┘│
+│  ┌────────────────────────────────────────────────────────┐│
+│  │ Task Store (data/tasks.json)                          ││
+│  │ pending-approval → approved → executing → completed   ││
 │  └────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────┘
                       │ stdio
-        ┌─────────────┼─────────────┐
-        ▼             ▼             ▼
-   ┌─────────┐  ┌─────────┐  ┌─────────┐
-   │ MCP 1   │  │ MCP 2   │  │ MCP 3   │
-   │(github) │  │(filesys)│  │(google) │
-   └─────────┘  └─────────┘  └─────────┘
+        ┌─────────────┼─────────────┬─────────────┐
+        ▼             ▼             ▼             ▼
+   ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐
+   │ MCP 1   │  │ MCP 2   │  │ MCP 3   │  │ MCP 4   │
+   │(github) │  │(filesys)│  │(google) │  │(stripe) │
+   └─────────┘  └─────────┘  └─────────┘  └─────────┘
 ```
 
 ## Prerequisites
@@ -125,7 +130,37 @@ If `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` are not set, Porter
 
 The Google tools appear as `google/send_email`, `google/list_events`, `google/search_files`, etc. Write operations (send, create, delete) require Telegram approval; reads are allowed by default. See `config/policies.json` for the full list.
 
-### 5. Configure Data Anonymization
+### 5. Configure Notion (Optional)
+
+To add Notion integration:
+
+1. **Create a Notion integration** at [notion.so/my-integrations](https://www.notion.so/my-integrations)
+2. **Copy the Internal Integration Secret** (starts with `ntn_`)
+3. **Share pages/databases** with the integration: Open a page → ... → Connections → Add your integration
+4. **Set environment variable** in `.env`:
+   ```bash
+   NOTION_API_TOKEN=ntn_your-token-here
+   ```
+
+If `NOTION_API_TOKEN` is not set, Portero will skip the Notion MCP and start without it. Read operations (search, retrieve pages/blocks) are allowed by default; write operations (create/update/delete) require Telegram approval.
+
+### 6. Configure Stripe (Optional)
+
+To add Stripe integration for payment management:
+
+1. **Get your Stripe API key** from [dashboard.stripe.com/apikeys](https://dashboard.stripe.com/apikeys)
+2. **Set environment variable** in `.env`:
+   ```bash
+   STRIPE_API_KEY=sk_test_your-key-here
+   ```
+
+If `STRIPE_API_KEY` is not set, Portero will skip the Stripe MCP and start without it.
+
+**Default policies:**
+- **Read tools** (list/get customers, invoices, payments, subscriptions, balance) — `allow`
+- **Write tools** (create customer, invoice, payment, refund, subscription) — `require-approval`
+
+### 7. Configure Data Anonymization
 
 Edit `config/replacements.json` to define fake↔real mappings:
 
@@ -147,7 +182,7 @@ Edit `config/replacements.json` to define fake↔real mappings:
 }
 ```
 
-### 6. Configure Policies
+### 8. Configure Policies
 
 Edit `config/policies.json` to set permission rules:
 
@@ -165,7 +200,7 @@ Edit `config/policies.json` to set permission rules:
 }
 ```
 
-### 7. Generate SSL Certificates (Optional)
+### 9. Generate SSL Certificates (Optional)
 
 ```bash
 ./scripts/generate-certs.sh
@@ -173,7 +208,7 @@ Edit `config/policies.json` to set permission rules:
 
 Or skip SSL for local testing (uses HTTP).
 
-### 8. Start the Gateway
+### 10. Start the Gateway
 
 ```bash
 # Development mode (with hot reload)
@@ -232,19 +267,43 @@ Once running, message your bot:
 - `/grant <pattern> <duration>` - Grant temporary access
   - Examples: `/grant github/* 30m`, `/grant * 1h`
 - `/revoke` - Revoke all active grants
+- `/allow <pattern>` - Persistently allow a tool/pattern (no approvals needed)
+- `/deny <pattern>` - Persistently deny a tool/pattern
+- `/rules` - List persistent rules
+- `/unrule <id>` - Remove a persistent rule
+- `/tasks` - Show recent tasks grouped by status
 - `/pending` - Show pending approval requests
 - `/logs` - Show recent audit logs
 - `/help` - Show all commands
 
-## How 2FA Approval Works
+## How Async Approval Works
+
+Portero uses a fully asynchronous approval flow — the HTTP request is never blocked waiting for Telegram approval.
 
 1. Claude Code calls a tool (e.g., `github/create_pull_request`)
-2. Gateway intercepts the request
-3. Policy engine checks: requires approval
-4. Telegram bot sends you a message with **Approve/Deny** buttons
-5. You click a button
-6. Gateway proceeds or blocks based on your decision
-7. Response returns to Claude Code
+2. Gateway checks policy: requires approval
+3. Gateway creates a **task** (status: `pending-approval`), sends Telegram message with Approve/Deny buttons, and **returns immediately** with a task ID
+4. Claude Code receives `{ status: "pending-approval", taskId: "..." }` and can continue working
+5. Admin approves/denies via Telegram buttons
+6. If approved, Portero executes the tool in the background and stores the result
+7. Claude Code calls `portero/check_task` with the task ID to retrieve the result
+8. If not ready yet, Claude Code can call `portero/check_task` again later
+
+This means:
+- No timeout pressure — approvals can happen whenever
+- Claude Code stays responsive while waiting
+- Multiple approvals can be pending simultaneously
+
+## Virtual Tools
+
+Portero injects these virtual tools alongside your MCP tools:
+
+| Tool | Description |
+|------|-------------|
+| `portero/search_tools` | Search available tools by keyword or category |
+| `portero/call` | Call any tool by its full name (useful for non-pinned tools) |
+| `portero/check_task` | Check status/result of a pending or completed async task |
+| `portero/list_tasks` | List recent tasks with optional status filter |
 
 ## Configuration Reference
 
@@ -262,13 +321,19 @@ Policy actions:
 
 - `allow` — Allow without approval
 - `deny` — Block completely
-- `require-approval` — Request Telegram approval
+- `require-approval` — Request Telegram approval (async)
 
 Patterns support wildcards:
 
 - `github/*` — All GitHub tools
 - `*/delete_*` — All delete operations
 - `*` — All tools
+
+Policy priority (highest first):
+1. Persistent rules (from Telegram `/allow`, `/deny` commands)
+2. Config exact matches (from `config/policies.json`)
+3. Config pattern matches (wildcards)
+4. Default policy
 
 ### Temporary Grants
 
@@ -303,15 +368,16 @@ Skip approval for a limited time:
 portero/
 ├── src/
 │   ├── index.ts                 # Entry point
-│   ├── config/                  # Config loader
-│   ├── gateway/                 # HTTP server & handler
+│   ├── config/                  # Config loader & types
+│   ├── gateway/                 # HTTP server & MCP handler
 │   ├── mcp/                     # MCP client management
 │   ├── middleware/              # Anonymizer, policy, approval
-│   ├── telegram/                # Telegram bot
-│   ├── db/                      # SQLite database
+│   ├── telegram/                # Telegram bot & admin store
+│   ├── db/                      # File-backed JSON storage
+│   ├── storage/                 # Atomic file operations & paths
 │   └── utils/                   # Logger, crypto
 ├── config/                      # JSON config files
-├── docker/                      # Docker setup
+├── data/                        # Runtime data (auto-created)
 └── scripts/                     # Helper scripts
 ```
 
@@ -323,13 +389,15 @@ npm run build    # Compile TypeScript
 npm start        # Start production build
 ```
 
-### Database
+### Storage
 
-SQLite database at `./data/gateway.db` stores:
+File-backed JSON storage in `./data/`:
 
-- Pending approvals
-- Temporary grants
-- Audit logs
+- `approvals.json` — Legacy pending approvals (kept for backward compatibility)
+- `tasks.json` — Async task tracking (pending → approved → executing → completed)
+- `grants.json` — Temporary access grants
+- `rules.json` — Persistent policy rules (from /allow, /deny commands)
+- `audit.ndjson` — Append-only audit log (NDJSON format)
 
 ## Troubleshooting
 
@@ -344,6 +412,7 @@ SQLite database at `./data/gateway.db` stores:
 - Verify MCP command is correct in `config/mcps.json`
 - Check MCP is installed: `npx -y @modelcontextprotocol/server-github --version`
 - Check environment variables are set (e.g., `GITHUB_TOKEN`)
+- MCPs with missing env vars are skipped automatically (non-blocking)
 
 ### Telegram bot not responding
 
@@ -376,7 +445,6 @@ MIT License - see [LICENSE](LICENSE) file for details
 ## Support
 
 - GitHub Issues: [Report bugs or request features]
-- Documentation: [See PROMPT.md for architecture details]
 
 ---
 

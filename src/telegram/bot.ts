@@ -7,7 +7,10 @@ import type { GrantsDB } from '../db/grants.js';
 import type { ApprovalsDB } from '../db/approvals.js';
 import type { AuditDB } from '../db/audit.js';
 import type { PolicyRulesDB } from '../db/policy-rules.js';
+import type { TasksDB } from '../db/tasks.js';
 import type { MCPClientManager } from '../mcp/client-manager.js';
+import type { Router } from '../mcp/router.js';
+import type { Anonymizer } from '../middleware/anonymizer.js';
 import logger from '../utils/logger.js';
 
 function withTimeout<T>(p: Promise<T>, timeoutMs: number): Promise<T> {
@@ -56,7 +59,10 @@ export class TelegramBot {
     private grantsDB: GrantsDB,
     private approvalsDB: ApprovalsDB,
     private policyRulesDB: PolicyRulesDB,
-    private auditDB: AuditDB
+    private auditDB: AuditDB,
+    private tasksDB: TasksDB,
+    private router: Router,
+    private anonymizer: Anonymizer
   ) {
     this.bot = new Telegraf(botToken);
     this.adminChatId = adminChatId;
@@ -99,6 +105,7 @@ Commands:
 /rules - List persistent rules
 /unrule <id> - Remove a persistent rule
 
+/tasks - Show recent tasks and their statuses
 /pending - Show pending approvals
 /logs - Show recent audit logs
 /help - Show this message`
@@ -261,10 +268,55 @@ Commands:
       await ctx.reply(ok ? `🗑️ Rule removed: ${id}` : `Rule not found: ${id}`);
     });
 
+    this.bot.command('tasks', async (ctx) => {
+      if (!this.isAdmin(ctx)) return;
+
+      const tasks = await this.tasksDB.listAll(30);
+
+      if (tasks.length === 0) {
+        await ctx.reply('No tasks yet');
+        return;
+      }
+
+      const groups: Record<string, string[]> = {
+        'Pending Approval': [],
+        'Executing': [],
+        'Completed': [],
+        'Denied / Failed': [],
+      };
+
+      for (const t of tasks) {
+        const age = this.formatAge(t.createdAt);
+        const shortId = t.id.slice(0, 8);
+        const checked = t.checkedAt ? ' (checked)' : '';
+
+        if (t.status === 'pending-approval') {
+          groups['Pending Approval'].push(`  ⏳ ${t.toolName} [${shortId}] ${age}`);
+        } else if (t.status === 'approved-queued' || t.status === 'executing') {
+          groups['Executing'].push(`  ⚙️ ${t.toolName} [${shortId}] ${age}`);
+        } else if (t.status === 'completed') {
+          groups['Completed'].push(`  ✅ ${t.toolName} [${shortId}] ${age}${checked}`);
+        } else {
+          const label = t.status === 'denied' ? '⛔' : '❌';
+          groups['Denied / Failed'].push(`  ${label} ${t.toolName} [${shortId}] ${age}`);
+        }
+      }
+
+      const lines: string[] = ['📋 Tasks'];
+      for (const [title, items] of Object.entries(groups)) {
+        if (items.length === 0) continue;
+        lines.push('');
+        lines.push(`${title}:`);
+        lines.push(...items);
+      }
+
+      await ctx.reply(lines.join('\n'));
+    });
+
     this.bot.command('pending', async (ctx) => {
       if (!this.isAdmin(ctx)) return;
 
-      const pending = await this.approvalsDB.getPending();
+      const pending = await this.tasksDB.listPending();
 
       if (pending.length === 0) {
         await ctx.reply('No pending approvals');
@@ -273,9 +325,9 @@ Commands:
 
       let message = `⏳ Pending Approvals: ${pending.length}\n\n`;
       message += pending
-        .map((approval, i) => {
-          const remaining = Math.ceil((approval.expiresAt.getTime() - Date.now()) / 1000 / 60);
-          return `${i + 1}. ${approval.toolName}\n   ID: ${approval.id}\n   Expires in: ${remaining}m`;
+        .map((task, i) => {
+          const age = this.formatAge(task.createdAt);
+          return `${i + 1}. ${task.toolName}\n   ID: ${task.id}\n   Created: ${age}`;
         })
         .join('\n\n');
 
@@ -307,59 +359,198 @@ Commands:
 
   private setupCallbackHandlers(): void {
     this.bot.on('callback_query', async (ctx) => {
-      if (!this.isAdmin(ctx)) return;
+      try {
+        if (!this.isAdmin(ctx)) return;
 
-      const data = (ctx.callbackQuery as any)?.data as string | undefined;
-      if (!data) return;
+        const data = (ctx.callbackQuery as any)?.data as string | undefined;
+        if (!data) return;
 
-      const [action, approvalId] = data.split(':');
-      const approval = approvalId ? await this.approvalsDB.get(approvalId) : null;
+        // Handle change_policy callbacks from execution notices
+        if (data.startsWith('change_policy:')) {
+          const parts = data.split(':');
+          // Format: change_policy:<action>:<toolName>
+          const action = parts[1] as 'require-approval' | 'deny';
+          const toolName = parts.slice(2).join(':'); // tool name might contain colons
+          if (toolName && (action === 'require-approval' || action === 'deny')) {
+            await this.policyRulesDB.upsert(toolName, action);
+            const label = action === 'deny' ? '⛔ Denied' : '🔐 Require approval';
+            await ctx.answerCbQuery(`${label}: ${toolName}`);
+            await ctx.editMessageReplyMarkup(undefined);
+            await ctx.reply(`${label}\nPattern: ${toolName}`);
+            return;
+          }
+          await ctx.answerCbQuery('Invalid action');
+          return;
+        }
 
-      const finalize = async (status: 'approved' | 'denied', note: string) => {
-        if (approvalId) await this.approvalsDB.updateStatus(approvalId, status);
-        await ctx.answerCbQuery(note);
-        await ctx.editMessageReplyMarkup(undefined);
-        await ctx.reply(`${note} (${approvalId})`);
-      };
+        // Task-based approval callbacks
+        // Format: <action>:<taskId> — taskId is a full UUID (no colons)
+        const colonIdx = data.indexOf(':');
+        const action = colonIdx > 0 ? data.slice(0, colonIdx) : data;
+        const taskId = colonIdx > 0 ? data.slice(colonIdx + 1) : '';
+        const task = taskId ? await this.tasksDB.get(taskId) : null;
 
-      if (action === 'approve') {
-        await finalize('approved', '✅ Approved');
-        logger.info('Approval approved via Telegram', { approvalId });
-        return;
+        if (!task) {
+          await ctx.answerCbQuery('Task not found');
+          return;
+        }
+
+        const finalize = async (status: 'approved' | 'denied', note: string) => {
+          await ctx.answerCbQuery(note);
+          await ctx.editMessageReplyMarkup(undefined);
+          await ctx.reply(`${note} (${taskId.slice(0, 8)})`);
+        };
+
+        if (action === 'approve') {
+          if (task.status === 'pending-approval') {
+            await this.tasksDB.updateStatus(taskId, 'approved-queued');
+            await finalize('approved', '✅ Approved');
+            logger.info('Task approved via Telegram', { taskId });
+            void this.executeApprovedTask(taskId);
+          } else {
+            await ctx.answerCbQuery('Task already processed');
+          }
+          return;
+        }
+
+        if (action === 'deny') {
+          if (task.status === 'pending-approval') {
+            await this.tasksDB.updateStatus(taskId, 'denied');
+            await finalize('denied', '❌ Denied');
+            logger.info('Task denied via Telegram', { taskId });
+          } else {
+            await ctx.answerCbQuery('Task already processed');
+          }
+          return;
+        }
+
+        if (action === 'approve_grant10m') {
+          if (task.status === 'pending-approval') {
+            await this.grantsDB.create(task.toolName, 10 * 60);
+            await this.tasksDB.updateStatus(taskId, 'approved-queued');
+            await finalize('approved', '✅ Approved + Grant 10m');
+            void this.executeApprovedTask(taskId);
+          } else {
+            await ctx.answerCbQuery('Task already processed');
+          }
+          return;
+        }
+
+        if (action === 'approve_grant1h') {
+          if (task.status === 'pending-approval') {
+            await this.grantsDB.create(task.toolName, 60 * 60);
+            await this.tasksDB.updateStatus(taskId, 'approved-queued');
+            await finalize('approved', '✅ Approved + Grant 1h');
+            void this.executeApprovedTask(taskId);
+          } else {
+            await ctx.answerCbQuery('Task already processed');
+          }
+          return;
+        }
+
+        if (action === 'approve_allow_tool') {
+          if (task.status === 'pending-approval') {
+            await this.policyRulesDB.upsert(task.toolName, 'allow');
+            await this.tasksDB.updateStatus(taskId, 'approved-queued');
+            await finalize('approved', '✅ Approved + Always allow tool');
+            void this.executeApprovedTask(taskId);
+          } else {
+            await ctx.answerCbQuery('Task already processed');
+          }
+          return;
+        }
+
+        if (action === 'deny_always_tool') {
+          if (task.status === 'pending-approval') {
+            await this.policyRulesDB.upsert(task.toolName, 'deny');
+            await this.tasksDB.updateStatus(taskId, 'denied');
+            await finalize('denied', '⛔ Denied + Always deny tool');
+          } else {
+            await ctx.answerCbQuery('Task already processed');
+          }
+          return;
+        }
+
+        await ctx.answerCbQuery('Unknown action');
+      } catch (error) {
+        logger.error('Callback query handler failed', {
+          error: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+        });
+        // Always answer the callback to prevent Telegram UI from hanging
+        try {
+          await ctx.answerCbQuery('Error processing action');
+        } catch {
+          // Already answered or timed out
+        }
       }
-
-      if (action === 'deny') {
-        await finalize('denied', '❌ Denied');
-        logger.info('Approval denied via Telegram', { approvalId });
-        return;
-      }
-
-      if (action === 'approve_grant10m') {
-        if (approval) await this.grantsDB.create(approval.toolName, 10 * 60);
-        await finalize('approved', '✅ Approved + Grant 10m');
-        return;
-      }
-
-      if (action === 'approve_grant1h') {
-        if (approval) await this.grantsDB.create(approval.toolName, 60 * 60);
-        await finalize('approved', '✅ Approved + Grant 1h');
-        return;
-      }
-
-      if (action === 'approve_allow_tool') {
-        if (approval) await this.policyRulesDB.upsert(approval.toolName, 'allow');
-        await finalize('approved', '✅ Approved + Always allow tool');
-        return;
-      }
-
-      if (action === 'deny_always_tool') {
-        if (approval) await this.policyRulesDB.upsert(approval.toolName, 'deny');
-        await finalize('denied', '⛔ Denied + Always deny tool');
-        return;
-      }
-
-      await ctx.answerCbQuery('Unknown action');
     });
+  }
+
+  /**
+   * Execute an approved task: call the MCP, deanonymize, store result
+   */
+  private async executeApprovedTask(taskId: string): Promise<void> {
+    const task = await this.tasksDB.get(taskId);
+    if (!task) return;
+
+    await this.tasksDB.updateStatus(taskId, 'executing');
+
+    try {
+      const result = await this.router.callTool(task.toolName, task.args);
+      const fakeResult = this.anonymizer.deanonymizeResponse(result);
+
+      await this.tasksDB.setResult(taskId, fakeResult);
+
+      await this.auditDB.log({
+        toolName: task.toolName,
+        args: task.originalArgs,
+        result: fakeResult,
+        policyAction: task.policyAction,
+        approvalStatus: 'approved',
+      });
+
+      logger.info('Task executed successfully', { taskId, toolName: task.toolName });
+
+      // Notify admin of completion
+      if (this.adminChatId) {
+        const shortId = taskId.slice(0, 8);
+        try {
+          await this.bot.telegram.sendMessage(
+            this.adminChatId,
+            `✅ Task completed: ${task.toolName} [${shortId}]\nUse portero/check_task to retrieve the result.`
+          );
+        } catch {
+          // Non-critical
+        }
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      await this.tasksDB.setError(taskId, errorMessage);
+
+      await this.auditDB.log({
+        toolName: task.toolName,
+        args: task.originalArgs,
+        policyAction: task.policyAction,
+        approvalStatus: 'approved',
+        error: errorMessage,
+      });
+
+      logger.error('Task execution failed', { taskId, toolName: task.toolName, error: errorMessage });
+
+      // Notify admin of failure
+      if (this.adminChatId) {
+        const shortId = taskId.slice(0, 8);
+        try {
+          await this.bot.telegram.sendMessage(
+            this.adminChatId,
+            `❌ Task failed: ${task.toolName} [${shortId}]\n${this.truncate(errorMessage, 200)}`
+          );
+        } catch {
+          // Non-critical
+        }
+      }
+    }
   }
 
   private isAdmin(ctx: any): boolean {
@@ -392,6 +583,17 @@ Commands:
     return hours * 3600 + minutes * 60;
   }
 
+  private formatAge(date: Date): string {
+    const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+    if (seconds < 60) return `${seconds}s ago`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.floor(hours / 24);
+    return `${days}d ago`;
+  }
+
   async enqueueExecutionNotice(notice: ExecutionNotice): Promise<void> {
     // If we don't have an admin yet, don't spam random chats.
     if (!this.adminChatId) return;
@@ -421,8 +623,32 @@ Commands:
 
     const text = this.formatExecutionBatch(batch);
 
+    // Collect unique auto-allowed tool names for config change buttons
+    const autoAllowed = new Set<string>();
+    for (const n of batch) {
+      if (n.status === 'ok' && n.policyAction === 'allow') {
+        autoAllowed.add(n.toolName);
+      }
+    }
+
+    const buttons: Array<Array<ReturnType<typeof Markup.button.callback>>> = [];
+    if (autoAllowed.size > 0 && autoAllowed.size <= 3) {
+      for (const toolName of autoAllowed) {
+        const shortName = toolName.split('/').pop() || toolName;
+        buttons.push([
+          Markup.button.callback(`🔐 Require approval: ${shortName}`, `change_policy:require-approval:${toolName}`),
+          Markup.button.callback(`⛔ Deny: ${shortName}`, `change_policy:deny:${toolName}`),
+        ]);
+      }
+    }
+
     try {
-      await this.bot.telegram.sendMessage(this.adminChatId, text);
+      if (buttons.length > 0) {
+        const keyboard = Markup.inlineKeyboard(buttons);
+        await this.bot.telegram.sendMessage(this.adminChatId, text, keyboard);
+      } else {
+        await this.bot.telegram.sendMessage(this.adminChatId, text);
+      }
     } catch (error) {
       logger.warn('Failed to send execution notice batch', {
         error: error instanceof Error ? error.message : String(error),
@@ -545,55 +771,26 @@ Commands:
     return lines.join('\n');
   }
 
-  private previewArgs(toolName: string, args: any): string | null {
-    if (!args) return null;
-
-    // Friendly previews for common tools
-    if (toolName === 'filesystem/write_file') {
-      const path = args?.path;
-      const content = args?.content;
-      const len = typeof content === 'string' ? content.length : null;
-      // Privacy-friendly preview: do not echo full content.
-      const contentMeta = typeof content === 'string' ? `len=${len}` : `type=${typeof content}`;
-      if (path) return `path=${path} content(${contentMeta})`;
-      return null;
-    }
-
-    if (toolName === 'filesystem/read_text_file' || toolName === 'filesystem/read_file') {
-      const path = args?.path;
-      if (path) return `path=${path}`;
-      return null;
-    }
-
-    // Generic JSON preview
-    try {
-      const s = JSON.stringify(args);
-      return `args=${this.truncate(s, 200)}`;
-    } catch {
-      return null;
-    }
-  }
-
   private truncate(s: string, max: number): string {
     if (s.length <= max) return s;
     return `${s.slice(0, max)}…`;
   }
 
-  async sendApprovalRequest(approvalId: string, toolName: string, args: any): Promise<void> {
-    const message = this.formatApprovalMessage(approvalId, toolName, args);
+  async sendApprovalRequest(taskId: string, toolName: string, args: any): Promise<void> {
+    const message = this.formatApprovalMessage(taskId, toolName, args);
 
     const keyboard = Markup.inlineKeyboard([
       [
-        Markup.button.callback('✅ Approve', `approve:${approvalId}`),
-        Markup.button.callback('❌ Deny', `deny:${approvalId}`),
+        Markup.button.callback('✅ Approve', `approve:${taskId}`),
+        Markup.button.callback('❌ Deny', `deny:${taskId}`),
       ],
       [
-        Markup.button.callback('✅ + Grant 10m', `approve_grant10m:${approvalId}`),
-        Markup.button.callback('✅ + Grant 1h', `approve_grant1h:${approvalId}`),
+        Markup.button.callback('✅ + Grant 10m', `approve_grant10m:${taskId}`),
+        Markup.button.callback('✅ + Grant 1h', `approve_grant1h:${taskId}`),
       ],
       [
-        Markup.button.callback('✅ Always allow tool', `approve_allow_tool:${approvalId}`),
-        Markup.button.callback('⛔ Always deny tool', `deny_always_tool:${approvalId}`),
+        Markup.button.callback('✅ Always allow tool', `approve_allow_tool:${taskId}`),
+        Markup.button.callback('⛔ Always deny tool', `deny_always_tool:${taskId}`),
       ],
     ]);
 
@@ -602,49 +799,167 @@ Commands:
     }
 
     const sentMessage = await this.bot.telegram.sendMessage(this.adminChatId, message, keyboard);
-    await this.approvalsDB.setTelegramMessageId(approvalId, sentMessage.message_id);
+    await this.tasksDB.setTelegramMessageId(taskId, sentMessage.message_id);
 
-    logger.info('Sent approval request via Telegram', { approvalId, toolName });
+    logger.info('Sent approval request via Telegram', { taskId, toolName });
   }
 
-  private formatApprovalMessage(approvalId: string, toolName: string, args: any): string {
+  private formatApprovalMessage(taskId: string, toolName: string, args: any): string {
     const lines: string[] = [];
     lines.push('🔔 Approval Required');
     lines.push('');
     lines.push(`Tool: ${toolName}`);
 
-    const to = args?.to;
-    const cc = args?.cc;
-    const bcc = args?.bcc;
-    const subject = args?.subject;
-    const body = args?.body;
+    // Try type-specific formatters in order; first non-null wins
+    const formatted =
+      this.formatEmail(args) ??
+      this.formatCalendar(toolName, args) ??
+      this.formatFileOps(toolName, args) ??
+      this.formatGitHub(toolName, args) ??
+      this.formatNotion(toolName, args) ??
+      this.formatStripe(toolName, args) ??
+      this.formatGenericSmart(args);
 
-    const looksLikeEmail =
-      typeof to === 'string' || Array.isArray(to) || typeof subject === 'string' || typeof body === 'string';
-
-    if (looksLikeEmail) {
-      if (to) lines.push(`To: ${Array.isArray(to) ? to.join(', ') : String(to)}`);
-      if (cc) lines.push(`Cc: ${Array.isArray(cc) ? cc.join(', ') : String(cc)}`);
-      if (bcc) lines.push(`Bcc: ${Array.isArray(bcc) ? bcc.join(', ') : String(bcc)}`);
-      if (subject) lines.push(`Subject: ${String(subject)}`);
-
-      if (typeof body === 'string') {
-        const preview = body.length > 800 ? `${body.slice(0, 800)}\n…(truncated, ${body.length} chars)` : body;
-        lines.push('');
-        lines.push('Body:');
-        lines.push(preview);
-      } else {
-        lines.push('');
-        lines.push(`Args: ${JSON.stringify(args, null, 2)}`);
-      }
-    } else {
-      lines.push(`Args: ${JSON.stringify(args, null, 2)}`);
+    if (formatted) {
+      lines.push(...formatted);
     }
 
     lines.push('');
-    lines.push(`ID: ${approvalId}`);
+    lines.push(`ID: ${taskId}`);
 
     return lines.join('\n');
+  }
+
+  // --- Type-specific formatters ---
+
+  private formatEmail(args: any): string[] | null {
+    if (!args) return null;
+    const { to, cc, bcc, subject, body } = args;
+    const looksLikeEmail =
+      typeof to === 'string' || Array.isArray(to) || typeof subject === 'string' || typeof body === 'string';
+    if (!looksLikeEmail) return null;
+
+    const lines: string[] = [];
+    if (to) lines.push(`To: ${Array.isArray(to) ? to.join(', ') : String(to)}`);
+    if (cc) lines.push(`Cc: ${Array.isArray(cc) ? cc.join(', ') : String(cc)}`);
+    if (bcc) lines.push(`Bcc: ${Array.isArray(bcc) ? bcc.join(', ') : String(bcc)}`);
+    if (subject) lines.push(`Subject: ${String(subject)}`);
+    if (typeof body === 'string') {
+      const preview = body.length > 800 ? `${body.slice(0, 800)}\n…(truncated, ${body.length} chars)` : body;
+      lines.push('');
+      lines.push('Body:');
+      lines.push(preview);
+    }
+    return lines;
+  }
+
+  private formatCalendar(toolName: string, args: any): string[] | null {
+    if (!args) return null;
+    if (!(/event|calendar/i.test(toolName))) return null;
+
+    const lines: string[] = [];
+    if (args.summary || args.title) lines.push(`Event: ${args.summary || args.title}`);
+    if (args.start) lines.push(`Start: ${typeof args.start === 'object' ? JSON.stringify(args.start) : String(args.start)}`);
+    if (args.end) lines.push(`End: ${typeof args.end === 'object' ? JSON.stringify(args.end) : String(args.end)}`);
+    if (args.attendees) {
+      const attendees = Array.isArray(args.attendees)
+        ? args.attendees.map((a: any) => typeof a === 'string' ? a : a?.email || JSON.stringify(a)).join(', ')
+        : String(args.attendees);
+      lines.push(`Attendees: ${attendees}`);
+    }
+    if (args.location) lines.push(`Location: ${String(args.location)}`);
+    if (args.description) lines.push(`Description: ${this.truncate(String(args.description), 300)}`);
+    return lines.length > 0 ? lines : null;
+  }
+
+  private formatFileOps(toolName: string, args: any): string[] | null {
+    if (!args) return null;
+    if (!(/filesystem|file/i.test(toolName))) return null;
+
+    const lines: string[] = [];
+    const op = toolName.split('/').pop() || toolName;
+    lines.push(`Operation: ${op}`);
+    if (args.path) lines.push(`Path: ${String(args.path)}`);
+    if (args.destination) lines.push(`Destination: ${String(args.destination)}`);
+    if (typeof args.content === 'string') lines.push(`Content length: ${args.content.length} chars`);
+    return lines;
+  }
+
+  private formatGitHub(toolName: string, args: any): string[] | null {
+    if (!args) return null;
+    if (!toolName.startsWith('github/')) return null;
+
+    const lines: string[] = [];
+    const action = toolName.split('/').pop() || toolName;
+    lines.push(`Action: ${action}`);
+    if (args.owner && args.repo) lines.push(`Repo: ${args.owner}/${args.repo}`);
+    else if (args.repo) lines.push(`Repo: ${args.repo}`);
+    if (args.title) lines.push(`Title: ${String(args.title)}`);
+    if (args.body) lines.push(`Body: ${this.truncate(String(args.body), 300)}`);
+    if (args.branch) lines.push(`Branch: ${String(args.branch)}`);
+    if (args.head) lines.push(`Head: ${String(args.head)}`);
+    if (args.base) lines.push(`Base: ${String(args.base)}`);
+    return lines;
+  }
+
+  private formatNotion(toolName: string, args: any): string[] | null {
+    if (!args) return null;
+    if (!toolName.startsWith('notion/')) return null;
+
+    const lines: string[] = [];
+    const action = toolName.replace('notion/', '');
+    lines.push(`Action: ${action}`);
+    if (args.page_id) lines.push(`Page ID: ${String(args.page_id)}`);
+    if (args.block_id) lines.push(`Block ID: ${String(args.block_id)}`);
+    if (args.database_id) lines.push(`Database ID: ${String(args.database_id)}`);
+    if (args.properties) {
+      const keys = Object.keys(args.properties);
+      lines.push(`Properties: ${keys.join(', ')}`);
+    }
+    return lines;
+  }
+
+  private formatStripe(toolName: string, args: any): string[] | null {
+    if (!args) return null;
+    if (!toolName.startsWith('stripe/')) return null;
+
+    const lines: string[] = [];
+    const action = toolName.replace('stripe/', '');
+    lines.push(`Action: ${action}`);
+    if (args.amount !== undefined) {
+      const amount = typeof args.amount === 'number' ? (args.amount / 100).toFixed(2) : String(args.amount);
+      const currency = args.currency ? ` ${String(args.currency).toUpperCase()}` : '';
+      lines.push(`Amount: ${amount}${currency}`);
+    }
+    if (args.customer) lines.push(`Customer: ${String(args.customer)}`);
+    if (args.description) lines.push(`Description: ${this.truncate(String(args.description), 200)}`);
+    if (args.email) lines.push(`Email: ${String(args.email)}`);
+    if (args.name) lines.push(`Name: ${String(args.name)}`);
+    return lines;
+  }
+
+  private formatGenericSmart(args: any): string[] | null {
+    if (!args || typeof args !== 'object') return null;
+
+    const lines: string[] = [];
+    const entries = Object.entries(args);
+    for (const [key, value] of entries.slice(0, 8)) {
+      if (value === null || value === undefined) continue;
+      if (typeof value === 'string') {
+        lines.push(`${key}: ${this.truncate(value, 200)}`);
+      } else if (typeof value === 'number' || typeof value === 'boolean') {
+        lines.push(`${key}: ${String(value)}`);
+      } else if (Array.isArray(value)) {
+        lines.push(`${key}: [${value.length} items]`);
+      } else if (typeof value === 'object') {
+        const keys = Object.keys(value as object);
+        lines.push(`${key}: {${keys.slice(0, 5).join(', ')}${keys.length > 5 ? '...' : ''}}`);
+      }
+    }
+    if (entries.length > 8) {
+      lines.push(`…and ${entries.length - 8} more fields`);
+    }
+    return lines.length > 0 ? lines : null;
   }
 
   async start(): Promise<void> {

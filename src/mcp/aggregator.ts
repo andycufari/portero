@@ -177,10 +177,16 @@ export class Aggregator {
           });
         }
       } catch (error) {
-        logger.error('Failed to list resources from MCP', {
-          mcpName,
-          error: error instanceof Error ? error.message : String(error),
-        });
+        const errMsg = error instanceof Error ? error.message : String(error);
+        // -32601 = Method not found — MCP doesn't support resources, not an error
+        if (errMsg.includes('-32601') || errMsg.includes('Method not found')) {
+          logger.debug('MCP does not support resources/list (skipping)', { mcpName });
+        } else {
+          logger.error('Failed to list resources from MCP', {
+            mcpName,
+            error: errMsg,
+          });
+        }
       }
     }
 

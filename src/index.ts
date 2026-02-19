@@ -20,6 +20,7 @@ import { ApprovalsDB } from './db/approvals.js';
 import { GrantsDB } from './db/grants.js';
 import { PolicyRulesDB } from './db/policy-rules.js';
 import { AuditDB } from './db/audit.js';
+import { TasksDB } from './db/tasks.js';
 import {
   loadMCPsConfig,
   loadReplacementsConfig,
@@ -65,6 +66,7 @@ async function main() {
   const grantsDB = new GrantsDB(paths);
   const policyRulesDB = new PolicyRulesDB(paths);
   const auditDB = new AuditDB(paths);
+  const tasksDB = new TasksDB(paths);
 
   // Start cleanup task
   startCleanupTask(paths);
@@ -98,11 +100,14 @@ async function main() {
     grantsDB,
     approvalsDB,
     policyRulesDB,
-    auditDB
+    auditDB,
+    tasksDB,
+    router,
+    anonymizer
   );
 
   // Initialize approval gate
-  const approvalGate = new ApprovalGate(approvalsDB, telegramBot, gatewayConfig.approvalTimeoutSeconds);
+  const approvalGate = new ApprovalGate(tasksDB, telegramBot);
 
   // Initialize MCP handler
   const mcpHandler = new MCPHandler(
@@ -113,6 +118,7 @@ async function main() {
     approvalGate,
     grantsDB,
     auditDB,
+    tasksDB,
     telegramBot
   );
 

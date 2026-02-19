@@ -13,6 +13,7 @@ export async function initStorage(paths: StoragePaths): Promise<void> {
   await writeJsonFileAtomic(paths.approvalsJson, await readJsonFile(paths.approvalsJson, { approvals: [] }));
   await writeJsonFileAtomic(paths.grantsJson, await readJsonFile(paths.grantsJson, { grants: [] }));
   await writeJsonFileAtomic(paths.rulesJson, await readJsonFile(paths.rulesJson, { rules: [] }));
+  await writeJsonFileAtomic(paths.tasksJson, await readJsonFile(paths.tasksJson, { tasks: [] }));
 }
 
 export async function cleanupExpired(paths: StoragePaths): Promise<void> {

@@ -51,6 +51,31 @@ export class Router {
         arguments: args,
       });
 
+      // Check if the MCP returned an error in the content (some MCPs like Notion
+      // return HTTP errors as content rather than throwing)
+      if (response.content && Array.isArray(response.content)) {
+        for (const item of response.content) {
+          if (item.type === 'text' && typeof item.text === 'string') {
+            try {
+              const parsed = JSON.parse(item.text);
+              if (parsed.status === 'error' || parsed.object === 'error' || parsed.code) {
+                logger.warn('MCP tool returned error in content', {
+                  namespacedName,
+                  mcpName,
+                  toolName,
+                  errorCode: parsed.code,
+                  errorMessage: parsed.message,
+                  httpStatus: parsed.status,
+                  args: JSON.stringify(args).slice(0, 500),
+                });
+              }
+            } catch {
+              // Not JSON, ignore
+            }
+          }
+        }
+      }
+
       logger.info('Tool call succeeded', {
         namespacedName,
         mcpName,
@@ -64,6 +89,8 @@ export class Router {
         mcpName,
         toolName,
         error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+        args: JSON.stringify(args).slice(0, 500),
       });
       throw error;
     }
