@@ -24,6 +24,11 @@ export interface Resource {
   mimeType?: string;
 }
 
+/** Tools that are broken / superseded by virtual tools and should never be listed */
+const BLOCKED_TOOLS: Set<string> = new Set([
+  'notion/API-query-data-source',
+]);
+
 export class Aggregator {
   private toolsCache: Tool[] | null = null;
   private resourcesCache: Resource[] | null = null;
@@ -108,13 +113,14 @@ export class Aggregator {
   async listAllTools(refresh: boolean = false): Promise<Tool[]> {
     const allTools = await this.listAllToolsUnfiltered(refresh);
 
-    // If no MCP has pinnedTools configured, return everything (fully backward compatible)
+    // If no MCP has pinnedTools configured, only apply blocked-tool filter
     const hasPinning = Array.from(this.pinnedToolsByMCP.values()).some(pins => pins !== undefined);
     if (!hasPinning) {
-      return allTools;
+      return allTools.filter(tool => !BLOCKED_TOOLS.has(tool.name));
     }
 
     return allTools.filter(tool => {
+      if (BLOCKED_TOOLS.has(tool.name)) return false;
       const slashIdx = tool.name.indexOf('/');
       if (slashIdx === -1) return true;
 

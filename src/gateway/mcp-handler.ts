@@ -283,8 +283,8 @@ export class MCPHandler {
 
     logger.info('Tool call requested', { name });
 
-    // Handle virtual tools
-    if (name === 'notion/query-database') {
+    // Handle virtual tools + intercept broken Notion tool
+    if (name === 'notion/query-database' || name === 'notion/API-query-data-source') {
       return this.handleNotionQueryDatabase(args);
     }
     if (name === 'portero/search_tools') {
